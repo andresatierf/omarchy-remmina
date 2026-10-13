@@ -1,0 +1,206 @@
+#!/bin/bash
+
+# Remmina connection profiles behind the Omarchy shell's remote desktop picker.
+#
+#   omarchy-remmina              summon the picker
+#   omarchy-remmina list         rows for the picker, as JSON
+#   omarchy-remmina connect F    connect with profile F
+#   omarchy-remmina edit F       open profile F in Remmina's editor
+#   omarchy-remmina new [S]      create a profile, optionally for server S
+#   omarchy-remmina open         open Remmina's main window
+#   omarchy-remmina forget F     drop profile F from the recent list
+#
+# Profiles are offered most recently connected first. The list only carries a
+# profile's name, protocol, server, username and group: Remmina keeps saved
+# passwords in the same file, and nothing else is ever read out of it.
+
+set -uo pipefail
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+# How many recently used profiles are lifted to the top of the list.
+RECENT_MAX=${OMARCHY_REMMINA_RECENT:-5}
+
+I_RDP=$''
+I_VNC=$''
+I_SSH=$''
+I_SFTP=$'\U000F024B'
+I_SPICE=$''
+I_WWW=$'\U000F059F'
+I_OTHER=$'\U000F08B9'
+
+notify() { notify-send -a Remmina -- "$1" "${2-}" >/dev/null 2>&1; }
+
+die() {
+  notify "Remmina" "$1"
+  exit 1
+}
+
+# Remmina records where it keeps profiles in its own preferences; a profile
+# folder moved there is the one it reads, so it is the one we read too.
+profiles_dir() {
+  local pref=${XDG_CONFIG_HOME:-$HOME/.config}/remmina/remmina.pref dir
+  dir=$(sed -n 's/^datadir_path=//p' "$pref" 2>/dev/null | head -n 1)
+  for dir in "$dir" "${XDG_DATA_HOME:-$HOME/.local/share}/remmina" "$HOME/.remmina"; do
+    [[ -n $dir && -d $dir ]] && { printf '%s' "$dir"; return 0; }
+  done
+  return 1
+}
+
+# Recently connected profiles: a path and when it was last used. Paths only —
+# no hosts, no users — but kept private all the same, like Remmina's own files.
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-remmina
+RECENT_FILE=$STATE_DIR/recent.json
+
+recent_read() {
+  local raw
+  raw=$(jq -c 'if (.version? == 1 and (.files | type) == "object") then . else {version: 1, files: {}} end' \
+    "$RECENT_FILE" 2>/dev/null)
+  [[ -z $raw ]] && raw='{"version":1,"files":{}}'
+  printf '%s' "$raw"
+}
+
+# Writes go through a private temp file in the same directory, so nothing is
+# ever written through a symlink left at the path.
+recent_update() {
+  local filter="$1" file="$2" tmp
+  mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 0
+  tmp=$(mktemp "$STATE_DIR/.recent.XXXXXX") || return 0
+  chmod 600 "$tmp" 2>/dev/null
+  if recent_read | jq -c --arg f "$file" --argjson at "$(date +%s)" "$filter" > "$tmp" 2>/dev/null && [[ -s $tmp ]]; then
+    mv -f "$tmp" "$RECENT_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+recent_touch() {
+  # Bounded, so profiles deleted long ago do not linger forever.
+  recent_update '.files[$f] = $at | .files |= (to_entries | sort_by(-.value) | .[0:50] | from_entries)' "$1"
+}
+
+recent_forget() {
+  recent_update 'del(.files[$f])' "$1"
+}
+
+# One row per profile. jq reads every profile at once and tells them apart by
+# input_filename. Only the keys named below are kept, which is what keeps a
+# saved password out of the payload.
+ROW_QUERY=$(cat <<'JQ'
+def glyph:
+  {
+    "rdp": $g_rdp, "vnc": $g_vnc, "ssh": $g_ssh, "sftp": $g_sftp,
+    "spice": $g_spice, "www": $g_www
+  }[.] // $g_other;
+
+[inputs | {file: input_filename, line: .}]
+| group_by(.file)
+| map(
+    .[0].file as $file
+    | [ .[].line
+        | capture("^(?<k>name|group|server|protocol|username)=(?<v>.*)$")
+        | {(.k): .v} ]
+    | add // {}
+    | (.protocol // "" | ascii_downcase) as $proto
+    | (.name // "") as $name
+    | (if $name != "" then $name
+       else ($file | split("/") | .[-1] | sub("\\.remmina$"; "")) end) as $name
+    | (.server // "") as $server
+    | (.username // "") as $user
+    | (.group // "") as $group
+    # "rdp://andre@192.168.1.9 · local": the protocol and the address, then the
+    # group, so a filter on any of them finds the profile.
+    | ((if $proto != "" then $proto + "://" else "" end)
+       + (if $user != "" and $server != "" then $user + "@" else "" end)
+       + $server) as $address
+    | ([$address, $group] | map(select(. != "")) | join(" · ")) as $sub
+    | ($recent.files[$file] // 0) as $at
+    | {name: $name, sub: $sub, glyph: ($proto | glyph), group: $group,
+       protocol: $proto, file: $file, at: $at}
+  )
+| (map(select(.at > 0)) | sort_by(-.at) | .[0:$max] | map(.file)) as $recentFiles
+| sort_by(.name | ascii_downcase)
+| map(. as $r | ($recentFiles | index($r.file)) as $rank
+      | del(.at) + {recent: ($rank != null), rank: ($rank // -1)})
+| {rows: .}
+JQ
+)
+
+list_profiles() {
+  local dir files=()
+  dir=$(profiles_dir) || { printf '{"rows":[],"missing":true}\n'; return; }
+  # Resolved, so a path here is the same string `connect` records as recent.
+  dir=$(readlink -f -- "$dir")
+  # nullglob: an empty folder must not hand jq the literal pattern — and jq
+  # given no files at all would sit reading stdin.
+  shopt -s nullglob
+  files=("$dir"/*.remmina)
+  shopt -u nullglob
+  (( ${#files[@]} == 0 )) && { printf '{"rows":[]}\n'; return; }
+
+  jq -R -n -c \
+    --argjson recent "$(recent_read)" --argjson max "$RECENT_MAX" \
+    --arg g_rdp "$I_RDP" --arg g_vnc "$I_VNC" --arg g_ssh "$I_SSH" \
+    --arg g_sftp "$I_SFTP" --arg g_spice "$I_SPICE" --arg g_www "$I_WWW" \
+    --arg g_other "$I_OTHER" \
+    "$ROW_QUERY" "${files[@]}"
+}
+
+# A profile path arrives from the picker. Only a .remmina file that really lives
+# in the profiles folder is accepted, so the verbs below cannot be pointed at
+# anything else on disk.
+profile_arg() {
+  local file="${1-}" dir real
+  [[ -n $file ]] || die "No profile given"
+  dir=$(profiles_dir) || die "No Remmina profiles folder"
+  real=$(readlink -f -- "$file" 2>/dev/null) || die "Profile not found"
+  dir=$(readlink -f -- "$dir")
+  [[ $real == "$dir"/*.remmina && -f $real ]] || die "Not a Remmina profile: ${file##*/}"
+  printf '%s' "$real"
+}
+
+# Remmina is single-instance: these calls hand the request to a running copy
+# and return, or start one. Launch it the way Omarchy launches apps, so it ends
+# up in its own systemd scope rather than as a child of the shell.
+remmina_run() {
+  command -v remmina >/dev/null 2>&1 || die "Remmina is not installed"
+  if command -v uwsm-app >/dev/null 2>&1; then
+    exec uwsm-app -- remmina "$@"
+  fi
+  exec setsid -f remmina "$@" >/dev/null 2>&1
+}
+
+case "${1-}" in
+  list)
+    list_profiles
+    exit 0 ;;
+  connect)
+    file=$(profile_arg "${2-}") || exit 1
+    recent_touch "$file"
+    remmina_run -c "$file" ;;
+  edit)
+    file=$(profile_arg "${2-}") || exit 1
+    remmina_run -e "$file" ;;
+  new)
+    if [[ -n ${2-} ]]; then remmina_run --new --server "$2"; else remmina_run --new; fi ;;
+  open)
+    remmina_run ;;
+  forget)
+    # The file may already be gone, which is exactly when forgetting it matters,
+    # so this takes the path as given rather than through profile_arg.
+    [[ -n ${2-} ]] && recent_forget "$2"
+    exit 0 ;;
+  ""|pick)
+    # The picker is the shell overlay; this script provides its rows and does
+    # its work. The id comes from the manifest we ship beside, so it cannot
+    # drift from the plugin the shell actually loaded.
+    id=$(jq -r '.id // empty' "${SELF%/bin/*}/manifest.json" 2>/dev/null)
+    [[ -n $id ]] || die "Could not read the plugin id from manifest.json"
+    omarchy-shell shell summon "$id" '{}' >/dev/null 2>&1 ||
+      die "The Omarchy shell is not running"
+    exit 0 ;;
+  -h|--help|help)
+    sed -n '3,15p' "$SELF" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  *) echo "omarchy-remmina: unknown command '$1'" >&2; exit 2 ;;
+esac
